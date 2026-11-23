@@ -1,0 +1,331 @@
+diff -ruN a/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LockScreenLyrics.java b/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LockScreenLyrics.java
+--- a/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LockScreenLyrics.java	2026-11-23 20:09:35.572258835 +0000
++++ b/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LockScreenLyrics.java	2026-11-23 20:09:35.697117431 +0000
+@@ -117,7 +117,8 @@
+             cachedCleanedTitle = parsed[1];
+             cachedCleanedArtist = parsed[0];
+ 
+-            if (!Settings.LYRICS_ENABLED.get() || !Settings.LYRICS_MEDIASESSION.get()) {
++            if (!Settings.LYRICS_ENABLED.get() || !Settings.LYRICS_MEDIASESSION.get()
++                    || Settings.LYRICS_COLOROS.get()) {
+                 LyricsManager.getInstance().removeListener(lyricsListener);
+                 ticker.stop();
+                 lastPushedTitle = null;
+@@ -151,7 +152,7 @@
+         playbackState = state;
+ 
+         if (Settings.LYRICS_ENABLED.get() && Settings.LYRICS_MEDIASESSION.get()
+-                && sessionRef != null) {
++                && !Settings.LYRICS_COLOROS.get() && sessionRef != null) {
+             ticker.schedule();
+         }
+     }
+@@ -169,6 +170,7 @@
+     private static void push() {
+         WeakReference<MediaSession> reference = sessionRef;
+         if (!Settings.LYRICS_ENABLED.get() || !Settings.LYRICS_MEDIASESSION.get()
++                || Settings.LYRICS_COLOROS.get()
+                 || reference == null || originalMetadata == null) {
+             restoreIfPushed();
+             LyricsManager.getInstance().removeListener(lyricsListener);
+diff -ruN a/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LyricInfoPublisher.java b/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LyricInfoPublisher.java
+--- a/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LyricInfoPublisher.java	1970-01-01 00:00:00.000000000 +0000
++++ b/extensions/music/src/main/java/app/morphe/extension/music/patches/lyrics/session/LyricInfoPublisher.java	2026-11-23 20:09:35.648021036 +0000
+@@ -0,0 +1,245 @@
++/*
++ * Copyright 2026 Morphe.
++ *
++ * See the included NOTICE file for GPLv3 Section 7 terms that apply to this code.
++ */
++
++package app.morphe.extension.music.patches.lyrics.session;
++
++import android.media.MediaMetadata;
++import android.media.session.MediaSession;
++import android.os.Handler;
++import android.os.Looper;
++import android.net.Uri;
++
++import androidx.annotation.Nullable;
++
++import org.json.JSONObject;
++
++import java.lang.ref.WeakReference;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++import java.util.Objects;
++
++import app.morphe.extension.music.patches.lyrics.LyricsManager;
++import app.morphe.extension.music.patches.lyrics.model.Lyrics;
++import app.morphe.extension.music.patches.lyrics.model.LyricsLine;
++import app.morphe.extension.music.patches.lyrics.model.MetadataCleaner;
++import app.morphe.extension.music.patches.lyrics.model.TrackInfo;
++import app.morphe.extension.music.settings.Settings;
++import app.morphe.extension.shared.Logger;
++
++/**
++ * Publishes the loaded, time-synced lyrics in the {@code "lyricInfo"} MediaMetadata entry that
++ * ColorOS / OPlus SystemUI reads for its native lock-screen and always-on-display lyric page.
++ *
++ * <p>Unlike {@link LockScreenLyrics}, the track title and artist are never rewritten, only one
++ * extra metadata key is added to a copy of the app's own metadata. The two features are
++ * mutually exclusive, {@link LockScreenLyrics} stands down while this one is on.
++ *
++ * <p>Hooked in front of the app's {@code MediaSession.setMetadata} call. The app's call runs
++ * right after the hook and would replace anything pushed synchronously, so the metadata with
++ * the lyrics is pushed from a short delayed task, directly through the framework so the hooked
++ * call site is not re-entered.
++ */
++@SuppressWarnings("unused")
++public final class LyricInfoPublisher {
++
++    private static final String LYRIC_INFO_KEY = "lyricInfo";
++    private static final String PROVIDER = "app.morphe.music";
++    /** The system reads at most about 512 KiB; stay well below it. */
++    private static final int MAX_LRC_CHARS = 200_000;
++    private static final long PUBLISH_DELAY_MS = 60;
++
++    private static final Handler handler = new Handler(Looper.getMainLooper());
++    private static final Runnable publishTask = LyricInfoPublisher::publish;
++
++    @Nullable
++    private static volatile WeakReference<MediaSession> sessionRef;
++    @Nullable
++    private static volatile MediaMetadata originalMetadata;
++    @Nullable
++    private static volatile Lyrics latestLyrics;
++    @Nullable
++    private static volatile String cleanedTitle;
++    @Nullable
++    private static volatile String cleanedArtist;
++    /** The payload currently attached to the session, or null if none is. */
++    @Nullable
++    private static volatile String publishedJson;
++
++    private static final LyricsManager.Listener lyricsListener = (state, lyrics) -> {
++        latestLyrics = state == LyricsManager.State.LOADED ? lyrics : null;
++        schedulePublish();
++    };
++
++    private LyricInfoPublisher() {
++    }
++
++    /** Re-evaluates after the setting, or a lyrics setting that changes the timing, changed. */
++    public static void onSettingsChanged() {
++        publishedJsonInvalidate();
++        schedulePublish();
++    }
++
++    /**
++     * Observed in front of the app's {@code MediaSession.setMetadata}. The app is about to
++     * replace the metadata, which drops the lyric info, so it has to be published again.
++     */
++    public static void onMediaSessionSetMetadata(MediaSession session, MediaMetadata original) {
++        try {
++            if (session == null || original == null) {
++                return;
++            }
++            if (!isEnabled()) {
++                LyricsManager.getInstance().removeListener(lyricsListener);
++                publishedJson = null;
++                return;
++            }
++
++            sessionRef = new WeakReference<>(session);
++            originalMetadata = original;
++
++            String title = original.getString(MediaMetadata.METADATA_KEY_TITLE);
++            String artist = original.getString(MediaMetadata.METADATA_KEY_ARTIST);
++            String[] parsed = MetadataCleaner.parseCleanTitleAndArtist(title, artist);
++            cleanedTitle = parsed[1];
++            cleanedArtist = parsed[0];
++
++            // The app's call replaces whatever was attached.
++            publishedJson = null;
++
++            Uri mediaUri = LyricsManager.parseMediaUri(original);
++            LyricsManager manager = LyricsManager.getInstance();
++            manager.onDisplayedTrackChanged(title, artist, mediaUri);
++            // Delivers the current state to the listener right away, which schedules a publish.
++            manager.addListener(lyricsListener);
++            schedulePublish();
++        } catch (Exception ex) {
++            Logger.printException(() -> "onMediaSessionSetMetadata failure", ex);
++        }
++    }
++
++    private static boolean isEnabled() {
++        return Settings.LYRICS_ENABLED.get() && Settings.LYRICS_COLOROS.get();
++    }
++
++    private static void publishedJsonInvalidate() {
++        publishedJson = null;
++    }
++
++    private static void schedulePublish() {
++        handler.removeCallbacks(publishTask);
++        handler.postDelayed(publishTask, PUBLISH_DELAY_MS);
++    }
++
++    private static void publish() {
++        try {
++            WeakReference<MediaSession> reference = sessionRef;
++            MediaSession session = reference != null ? reference.get() : null;
++            MediaMetadata original = originalMetadata;
++            if (session == null || original == null) {
++                return;
++            }
++            if (!isEnabled()) {
++                restoreIfPublished(session, original);
++                return;
++            }
++
++            LyricsManager manager = LyricsManager.getInstance();
++            Lyrics lyrics = latestLyrics;
++            TrackInfo track = manager.getCurrentTrack();
++            // The lyrics must belong to the track the session is showing.
++            if (lyrics == null || !lyrics.synced() || lyrics.isEmpty() || track == null
++                    || !Objects.equals(track.title(), cleanedTitle)
++                    || !Objects.equals(track.artist(), cleanedArtist)) {
++                restoreIfPublished(session, original);
++                return;
++            }
++
++            String json = buildJson(lyrics, original, manager);
++            if (json == null) {
++                restoreIfPublished(session, original);
++                return;
++            }
++            if (json.equals(publishedJson)) {
++                return;
++            }
++
++            session.setMetadata(new MediaMetadata.Builder(original)
++                    .putString(LYRIC_INFO_KEY, json)
++                    .build());
++            publishedJson = json;
++        } catch (Exception ex) {
++            Logger.printException(() -> "publish failure", ex);
++        }
++    }
++
++    private static void restoreIfPublished(MediaSession session, MediaMetadata original) {
++        if (publishedJson == null) {
++            return;
++        }
++        session.setMetadata(original);
++        publishedJson = null;
++    }
++
++    @Nullable
++    private static String buildJson(Lyrics lyrics, MediaMetadata original, LyricsManager manager)
++            throws Exception {
++        // Lyric time -> the video timeline the PlaybackState position is on. This undoes what
++        // LyricsManager.getPositionMs() applies when it reads a lyric time.
++        final long offsetMs = Settings.LYRICS_OFFSET_MS.get() + manager.getTemporaryOffsetMs();
++
++        List<long[]> order = new ArrayList<>();
++        List<String> texts = new ArrayList<>();
++        for (LyricsLine line : lyrics.lines()) {
++            // Background vocals overlap the main line in time and would make the page flicker.
++            if (line.isBG() || line.startTimeMs() == LyricsLine.NO_TIME) {
++                continue;
++            }
++            long timeMs = Math.max(0L, manager.toVideoTimeMs(line.startTimeMs() + offsetMs));
++            order.add(new long[]{timeMs, texts.size()});
++            String text = line.text() == null ? "" : line.text();
++            texts.add(text.replace('\r', ' ').replace('\n', ' ').trim());
++        }
++        if (texts.isEmpty()) {
++            return null;
++        }
++        order.sort((a, b) -> Long.compare(a[0], b[0]));
++
++        StringBuilder lrc = new StringBuilder();
++        for (long[] entry : order) {
++            lrc.append(timestamp(entry[0])).append(texts.get((int) entry[1])).append('\n');
++        }
++        if (lrc.length() > MAX_LRC_CHARS) {
++            return null;
++        }
++
++        String title = original.getString(MediaMetadata.METADATA_KEY_TITLE);
++        String artist = original.getString(MediaMetadata.METADATA_KEY_ARTIST);
++        String mediaId = original.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
++        String songId = mediaId != null && !mediaId.isEmpty() ? mediaId : String.valueOf(title);
++        long durationSeconds = original.getLong(MediaMetadata.METADATA_KEY_DURATION) / 1000;
++
++        return new JSONObject()
++                .put("songName", title == null ? "" : title)
++                .put("artist", artist == null ? "" : artist)
++                .put("songId", songId)
++                .put("lyricType", 0)
++                .put("lyric", lrc.toString())
++                .put("noLyric", false)
++                .put("provider", PROVIDER)
++                .put("source", PROVIDER + "-lyrics")
++                .put("trackKey", songId + "|" + String.valueOf(title).toLowerCase(Locale.ROOT)
++                        + "|" + String.valueOf(artist).toLowerCase(Locale.ROOT)
++                        + "|" + durationSeconds)
++                .put("sessionGeneration", 1)
++                .toString();
++    }
++
++    private static String timestamp(long ms) {
++        return String.format(Locale.US, "[%02d:%02d.%03d]",
++                ms / 60_000, (ms / 1000) % 60, ms % 1000);
++    }
++}
+diff -ruN a/extensions/music/src/main/java/app/morphe/extension/music/settings/Settings.java b/extensions/music/src/main/java/app/morphe/extension/music/settings/Settings.java
+--- a/extensions/music/src/main/java/app/morphe/extension/music/settings/Settings.java	2026-11-23 20:09:35.573985204 +0000
++++ b/extensions/music/src/main/java/app/morphe/extension/music/settings/Settings.java	2026-11-23 20:09:35.696843126 +0000
+@@ -195,6 +195,7 @@
+     public static final IntegerSetting LYRICS_OFFSET_MS = new IntegerSetting("morphe_music_lyrics_offset_ms", 0, false, parent(LYRICS_ENABLED));
+     public static final BooleanSetting LYRICS_SB_MATCHING = new BooleanSetting("morphe_music_lyrics_sb_matching", TRUE, false, parent(LYRICS_ENABLED));
+     public static final BooleanSetting LYRICS_MEDIASESSION = new BooleanSetting("morphe_music_lyrics_mediasession", FALSE, false, parent(LYRICS_ENABLED));
++    public static final BooleanSetting LYRICS_COLOROS = new BooleanSetting("morphe_music_lyrics_coloros", FALSE, false, parent(LYRICS_ENABLED));
+     public static final BooleanSetting LYRICS_MINIPLAYER = new BooleanSetting("morphe_music_lyrics_miniplayer", FALSE, false, parent(LYRICS_ENABLED));
+     public static final BooleanSetting LYRICS_FORCE_CAPITALIZE = new BooleanSetting("morphe_music_lyrics_force_capitalize", FALSE, false, parent(LYRICS_ENABLED));
+     public static final BooleanSetting LYRICS_STRIP_TRAILING_PUNCTUATION = new BooleanSetting("morphe_music_lyrics_strip_trailing_punctuation", FALSE, false, parent(LYRICS_ENABLED));
+diff -ruN a/patches/src/main/kotlin/app/morphe/patches/music/layout/lyrics/LyricsPatch.kt b/patches/src/main/kotlin/app/morphe/patches/music/layout/lyrics/LyricsPatch.kt
+--- a/patches/src/main/kotlin/app/morphe/patches/music/layout/lyrics/LyricsPatch.kt	2026-11-23 20:09:35.596810858 +0000
++++ b/patches/src/main/kotlin/app/morphe/patches/music/layout/lyrics/LyricsPatch.kt	2026-11-23 20:09:35.697320105 +0000
+@@ -52,6 +52,7 @@
+ private const val EXTENSION_CLASS = "Lapp/morphe/extension/music/patches/lyrics/LyricsPatch;"
+ internal const val PANEL_INSTALLER_CLASS = "Lapp/morphe/extension/music/patches/lyrics/ui/LyricsPanelInstaller;"
+ private const val LOCKSCREEN_CLASS = "Lapp/morphe/extension/music/patches/lyrics/session/LockScreenLyrics;"
++private const val LYRIC_INFO_CLASS = "Lapp/morphe/extension/music/patches/lyrics/session/LyricInfoPublisher;"
+ private const val MINIPLAYER_LYRICS_CLASS = "Lapp/morphe/extension/music/patches/lyrics/session/MiniplayerLyrics;"
+ private const val DEVICE_LYRICS_TAB_CLASS = "Lapp/morphe/extension/music/patches/lyrics/ui/DeviceLyricsTab;"
+ 
+@@ -212,6 +213,7 @@
+                     SwitchPreference("morphe_music_lyrics_sb_matching", summary = true),
+                     SwitchPreference("morphe_music_lyrics_miniplayer", summary = true),
+                     SwitchPreference("morphe_music_lyrics_mediasession", summary = true),
++                    SwitchPreference("morphe_music_lyrics_coloros", summary = true),
+                     NonInteractivePreference(
+                         key = "morphe_music_lyrics_mini_track_format",
+                         summaryKey = "morphe_music_lyrics_mini_track_format_menu_summary",
+@@ -486,6 +488,9 @@
+         addSetMetadataWithSessionHook(
+             "$LOCKSCREEN_CLASS->onMediaSessionSetMetadata(Landroid/media/session/MediaSession;Landroid/media/MediaMetadata;)V"
+         )
++        addSetMetadataWithSessionHook(
++            "$LYRIC_INFO_CLASS->onMediaSessionSetMetadata(Landroid/media/session/MediaSession;Landroid/media/MediaMetadata;)V"
++        )
+         addSetPlaybackStateHook("$EXTENSION_CLASS->onSetPlaybackState(Landroid/media/session/PlaybackState;)V")
+     }
+ }
+diff -ruN a/patches/src/main/resources/addresources/values/music/strings.xml b/patches/src/main/resources/addresources/values/music/strings.xml
+--- a/patches/src/main/resources/addresources/values/music/strings.xml	2026-11-23 20:09:35.636403280 +0000
++++ b/patches/src/main/resources/addresources/values/music/strings.xml	2026-11-23 20:09:35.697838527 +0000
+@@ -794,6 +794,8 @@
+     <string name="morphe_music_lyrics_dynamic_background_animated_summary">Move the background while playing, and pulse it with the music if YouTube Music has the microphone permission. Turn off for a still background that uses less battery</string>
+     <string name="morphe_music_lyrics_mediasession_title">Show MediaSession Lyrics on lock screen</string>
+     <string name="morphe_music_lyrics_mediasession_summary">Shows the current line on the lock screen, Android Auto and Bluetooth</string>
++    <string name="morphe_music_lyrics_coloros_title">Publish lyrics for ColorOS lock screen</string>
++    <string name="morphe_music_lyrics_coloros_summary">Adds the timed lyrics to the media session so the native ColorOS lock screen and always-on display lyrics can show them. Replaces the lock screen lyrics option above</string>
+     <string name="morphe_music_lyrics_miniplayer_title">Show Miniplayer Lyrics</string>
+     <string name="morphe_music_lyrics_miniplayer_summary">Shows the current line in the miniplayer, with the track moved to the subtitle</string>
+     <string name="morphe_music_lyrics_mini_track_format_title">Song title/artist format</string>
